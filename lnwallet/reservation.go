@@ -4,12 +4,12 @@ import (
 	"net"
 	"sync"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
 // ChannelContribution is the primary constituent of the funding workflow
@@ -284,7 +284,7 @@ func (r *ChannelReservation) SetNumConfsRequired(numConfs uint16) {
 // if the parameters are seemed unsound.
 func (r *ChannelReservation) CommitConstraints(csvDelay, maxHtlcs uint16,
 	maxValueInFlight, minHtlc lnwire.MilliSatoshi,
-	chanReserve btcutil.Amount) error {
+	chanReserve, dustLimit btcutil.Amount) error {
 
 	r.Lock()
 	defer r.Unlock()
@@ -294,6 +294,12 @@ func (r *ChannelReservation) CommitConstraints(csvDelay, maxHtlcs uint16,
 	const maxDelay = 10000
 	if csvDelay > maxDelay {
 		return ErrCsvDelayTooLarge(csvDelay, maxDelay)
+	}
+
+	// The dust limit should always be greater or equal to the channel
+	// reserve. The reservation request should be denied if otherwise.
+	if dustLimit > chanReserve {
+		return ErrChanReserveTooSmall(chanReserve, dustLimit)
 	}
 
 	// Fail if we consider the channel reserve to be too large.  We
@@ -329,6 +335,12 @@ func (r *ChannelReservation) CommitConstraints(csvDelay, maxHtlcs uint16,
 	if maxValueInFlight < minNumHtlc*minHtlc {
 		return ErrMaxValueInFlightTooSmall(maxValueInFlight,
 			minNumHtlc*minHtlc)
+	}
+
+	// Our dust limit should always be less than or equal our proposed
+	// channel reserve.
+	if r.ourContribution.DustLimit > chanReserve {
+		r.ourContribution.DustLimit = chanReserve
 	}
 
 	r.ourContribution.ChannelConfig.CsvDelay = csvDelay
@@ -391,7 +403,7 @@ func (r *ChannelReservation) ProcessSingleContribution(theirContribution *Channe
 // TheirContribution returns the counterparty's pending contribution to the
 // payment channel. See 'ChannelContribution' for further details regarding the
 // contents of a contribution. This attribute will ONLY be available after a
-// call to .ProcesContribution().
+// call to .ProcessContribution().
 //
 // NOTE: This SHOULD NOT be modified.
 func (r *ChannelReservation) TheirContribution() *ChannelContribution {
@@ -407,7 +419,7 @@ func (r *ChannelReservation) TheirContribution() *ChannelContribution {
 // BIP-69: https://github.com/bitcoin/bips/blob/master/bip-0069.mediawiki.
 //
 // NOTE: These signatures will only be populated after a call to
-// .ProcesContribution()
+// .ProcessContribution()
 func (r *ChannelReservation) OurSignatures() ([]*InputScript, []byte) {
 	r.RLock()
 	defer r.RUnlock()
@@ -422,11 +434,11 @@ func (r *ChannelReservation) OurSignatures() ([]*InputScript, []byte) {
 // https://github.com/bitcoin/bips/blob/master/bip-0069.mediawiki.
 // Additionally, verification is performed in order to ensure that the
 // counterparty supplied a valid signature to our version of the commitment
-// transaction.  Once this method returns, caller's should then call
-// .WaitForChannelOpen() which will block until the funding transaction obtains
-// the configured number of confirmations. Once the method unblocks, a
-// LightningChannel instance is returned, marking the channel available for
-// updates.
+// transaction.  Once this method returns, caller's should broadcast the
+// created funding transaction, then call .WaitForChannelOpen() which will
+// block until the funding transaction obtains the configured number of
+// confirmations. Once the method unblocks, a LightningChannel instance is
+// returned, marking the channel available for updates.
 func (r *ChannelReservation) CompleteReservation(fundingInputScripts []*InputScript,
 	commitmentSig []byte) (*channeldb.OpenChannel, error) {
 

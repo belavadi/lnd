@@ -174,9 +174,9 @@ var grpc = require('grpc');
 
 process.env.GRPC_SSL_CIPHER_SUITES = 'HIGH+ECDSA'
 
-// Lnd admin macaroon is at ~/.lnd/admin.macaroon on Linux and
-// ~/Library/Application Support/Lnd/admin.macaroon on Mac
-var m = fs.readFileSync('~/.lnd/admin.macaroon');
+// Lnd admin macaroon is at ~/.lnd/data/chain/bitcoin/simnet/admin.macaroon on Linux and
+// ~/Library/Application Support/Lnd/data/chain/bitcoin/simnet/admin.macaroon on Mac
+var m = fs.readFileSync('~/.lnd/data/chain/bitcoin/simnet/admin.macaroon');
 var macaroon = m.toString('hex');
 var meta = new grpc.Metadata().add('macaroon', macaroon);
 
@@ -195,13 +195,14 @@ var grpc = require('grpc');
 
 process.env.GRPC_SSL_CIPHER_SUITES = 'HIGH+ECDSA'
 
-// Lnd admin macaroon is at ~/.lnd/admin.macaroon on Linux and
-// ~/Library/Application Support/Lnd/admin.macaroon on Mac
-var m = fs.readFileSync('~/.lnd/admin.macaroon');
+// Lnd admin macaroon is at ~/.lnd/data/chain/bitcoin/simnet/admin.macaroon on Linux and
+// ~/Library/Application Support/Lnd/data/chain/bitcoin/simnet/admin.macaroon on Mac
+var m = fs.readFileSync('~/.lnd/data/chain/bitcoin/simnet/admin.macaroon');
 var macaroon = m.toString('hex');
 
 // build meta data credentials
-var metadata = new grpc.Metadata().add('macaroon', macaroon)
+var metadata = new grpc.Metadata()
+metadata.add('macaroon', macaroon)
 var macaroonCreds = grpc.credentials.createFromMetadataGenerator((_args, callback) => {
   callback(null, metadata);
 });

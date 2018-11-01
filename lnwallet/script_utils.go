@@ -9,10 +9,10 @@ import (
 
 	"golang.org/x/crypto/ripemd160"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/txscript"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 )
 
 var (
@@ -46,9 +46,9 @@ const (
 	maxStateHint uint64 = (1 << 48) - 1
 )
 
-// witnessScriptHash generates a pay-to-witness-script-hash public key script
+// WitnessScriptHash generates a pay-to-witness-script-hash public key script
 // paying to a version 0 witness program paying to the passed redeem script.
-func witnessScriptHash(witnessScript []byte) ([]byte, error) {
+func WitnessScriptHash(witnessScript []byte) ([]byte, error) {
 	bldr := txscript.NewScriptBuilder()
 
 	bldr.AddOp(txscript.OP_0)
@@ -57,9 +57,9 @@ func witnessScriptHash(witnessScript []byte) ([]byte, error) {
 	return bldr.Script()
 }
 
-// genMultiSigScript generates the non-p2sh'd multisig script for 2 of 2
+// GenMultiSigScript generates the non-p2sh'd multisig script for 2 of 2
 // pubkeys.
-func genMultiSigScript(aPub, bPub []byte) ([]byte, error) {
+func GenMultiSigScript(aPub, bPub []byte) ([]byte, error) {
 	if len(aPub) != 33 || len(bPub) != 33 {
 		return nil, fmt.Errorf("Pubkey size error. Compressed pubkeys only")
 	}
@@ -91,14 +91,14 @@ func GenFundingPkScript(aPub, bPub []byte, amt int64) ([]byte, *wire.TxOut, erro
 	}
 
 	// First, create the 2-of-2 multi-sig script itself.
-	witnessScript, err := genMultiSigScript(aPub, bPub)
+	witnessScript, err := GenMultiSigScript(aPub, bPub)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// With the 2-of-2 script in had, generate a p2wsh script which pays
 	// to the funding script.
-	pkScript, err := witnessScriptHash(witnessScript)
+	pkScript, err := WitnessScriptHash(witnessScript)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -152,11 +152,11 @@ func FindScriptOutputIndex(tx *wire.MsgTx, script []byte) (bool, uint32) {
 	return found, index
 }
 
-// ripemd160H calculates the ripemd160 of the passed byte slice. This is used to
+// Ripemd160H calculates the ripemd160 of the passed byte slice. This is used to
 // calculate the intermediate hash for payment pre-images. Payment hashes are
 // the result of ripemd160(sha256(paymentPreimage)). As a result, the value
 // passed in should be the sha256 of the payment hash.
-func ripemd160H(d []byte) []byte {
+func Ripemd160H(d []byte) []byte {
 	h := ripemd160.New()
 	h.Write(d)
 	return h.Sum(nil)
@@ -256,7 +256,7 @@ func senderHTLCScript(senderHtlcKey, receiverHtlcKey,
 	// pre-image. By using this little trick we're able save space on-chain
 	// as the witness includes a 20-byte hash rather than a 32-byte hash.
 	builder.AddOp(txscript.OP_HASH160)
-	builder.AddData(ripemd160H(paymentHash))
+	builder.AddData(Ripemd160H(paymentHash))
 	builder.AddOp(txscript.OP_EQUALVERIFY)
 
 	// This checks the receiver's signature so that a third party with
@@ -457,7 +457,7 @@ func receiverHTLCScript(cltvExpiry uint32, senderHtlcKey,
 	// payment pre-image, then we'll continue. Otherwise, we'll end the
 	// script here as this is the invalid payment pre-image.
 	builder.AddOp(txscript.OP_HASH160)
-	builder.AddData(ripemd160H(paymentHash))
+	builder.AddData(Ripemd160H(paymentHash))
 	builder.AddOp(txscript.OP_EQUALVERIFY)
 
 	// If the payment hash matches, then we'll also need to satisfy the
@@ -662,7 +662,7 @@ func createHtlcTimeoutTx(htlcOutput wire.OutPoint, htlcAmt btcutil.Amount,
 	if err != nil {
 		return nil, err
 	}
-	pkScript, err := witnessScriptHash(witnessScript)
+	pkScript, err := WitnessScriptHash(witnessScript)
 	if err != nil {
 		return nil, err
 	}
@@ -709,7 +709,7 @@ func createHtlcSuccessTx(htlcOutput wire.OutPoint, htlcAmt btcutil.Amount,
 	if err != nil {
 		return nil, err
 	}
-	pkScript, err := witnessScriptHash(witnessScript)
+	pkScript, err := WitnessScriptHash(witnessScript)
 	if err != nil {
 		return nil, err
 	}
@@ -902,7 +902,7 @@ func lockTimeToSequence(isSeconds bool, locktime uint32) uint32 {
 	return SequenceLockTimeSeconds | (locktime >> 9)
 }
 
-// commitScriptToSelf constructs the public key script for the output on the
+// CommitScriptToSelf constructs the public key script for the output on the
 // commitment transaction paying to the "owner" of said commitment transaction.
 // If the other party learns of the preimage to the revocation hash, then they
 // can claim all the settled funds in the channel, plus the unsettled funds.
@@ -919,7 +919,7 @@ func lockTimeToSequence(isSeconds bool, locktime uint32) uint32 {
 //         <timeKey>
 //     OP_ENDIF
 //     OP_CHECKSIG
-func commitScriptToSelf(csvTimeout uint32, selfKey, revokeKey *btcec.PublicKey) ([]byte, error) {
+func CommitScriptToSelf(csvTimeout uint32, selfKey, revokeKey *btcec.PublicKey) ([]byte, error) {
 	// This script is spendable under two conditions: either the
 	// 'csvTimeout' has passed and we can redeem our funds, or they can
 	// produce a valid signature with the revocation public key. The
@@ -953,10 +953,10 @@ func commitScriptToSelf(csvTimeout uint32, selfKey, revokeKey *btcec.PublicKey) 
 	return builder.Script()
 }
 
-// commitScriptUnencumbered constructs the public key script on the commitment
+// CommitScriptUnencumbered constructs the public key script on the commitment
 // transaction paying to the "other" party. The constructed output is a normal
 // p2wkh output spendable immediately, requiring no contestation period.
-func commitScriptUnencumbered(key *btcec.PublicKey) ([]byte, error) {
+func CommitScriptUnencumbered(key *btcec.PublicKey) ([]byte, error) {
 	// This script goes to the "other" party, and it spendable immediately.
 	builder := txscript.NewScriptBuilder()
 	builder.AddOp(txscript.OP_0)

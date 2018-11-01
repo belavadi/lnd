@@ -33,21 +33,21 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcwallet/wallet"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	flags "github.com/jessevdk/go-flags"
-	"github.com/lightningnetwork/lnd/autopilot"
+
+	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
-	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
+	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/walletunlocker"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
-	"github.com/roasbeef/btcwallet/wallet"
 )
 
 const (
@@ -56,15 +56,13 @@ const (
 )
 
 var (
-	//Commit stores the current commit hash of this build. This should be
-	//set using -ldflags during compilation.
-	Commit string
-
 	cfg              *config
-	shutdownChannel  = make(chan struct{})
 	registeredChains = newChainRegistry()
 
-	macaroonDatabaseDir string
+	// networkDir is the path to the directory of the currently active
+	// network. This path will hold the files related to each different
+	// network.
+	networkDir string
 
 	// End of ASN.1 time.
 	endOfTime = time.Date(2049, 12, 31, 23, 59, 59, 0, time.UTC)
@@ -102,12 +100,14 @@ func lndMain() error {
 	cfg = loadedConfig
 	defer func() {
 		if logRotator != nil {
+			ltndLog.Info("Shutdown complete")
 			logRotator.Close()
 		}
 	}()
 
 	// Show version at startup.
-	ltndLog.Infof("Version %s", version())
+	ltndLog.Infof("Version: %s, build=%s, logging=%s",
+		build.Version(), build.Deployment, build.LoggingType)
 
 	var network string
 	switch {
@@ -118,7 +118,7 @@ func lndMain() error {
 		network = "mainnet"
 
 	case cfg.Bitcoin.SimNet:
-		network = "simmnet"
+		network = "simnet"
 
 	case cfg.Bitcoin.RegTest:
 		network = "regtest"
@@ -195,39 +195,54 @@ func lndMain() error {
 	}
 	proxyOpts := []grpc.DialOption{grpc.WithTransportCredentials(cCreds)}
 
+	var (
+		privateWalletPw = lnwallet.DefaultPrivatePassphrase
+		publicWalletPw  = lnwallet.DefaultPublicPassphrase
+		birthday        = time.Now()
+		recoveryWindow  uint32
+		unlockedWallet  *wallet.Wallet
+	)
+
+	// We wait until the user provides a password over RPC. In case lnd is
+	// started with the --noseedbackup flag, we use the default password
+	// for wallet encryption.
+	if !cfg.NoSeedBackup {
+		walletInitParams, err := waitForWalletPassword(
+			cfg.RPCListeners, cfg.RESTListeners, serverOpts,
+			proxyOpts, tlsConf,
+		)
+		if err != nil {
+			return err
+		}
+
+		privateWalletPw = walletInitParams.Password
+		publicWalletPw = walletInitParams.Password
+		birthday = walletInitParams.Birthday
+		recoveryWindow = walletInitParams.RecoveryWindow
+		unlockedWallet = walletInitParams.Wallet
+
+		if recoveryWindow > 0 {
+			ltndLog.Infof("Wallet recovery mode enabled with "+
+				"address lookahead of %d addresses",
+				recoveryWindow)
+		}
+	}
+
 	var macaroonService *macaroons.Service
 	if !cfg.NoMacaroons {
 		// Create the macaroon authentication/authorization service.
-		macaroonService, err = macaroons.NewService(macaroonDatabaseDir,
-			macaroons.IPLockChecker)
+		macaroonService, err = macaroons.NewService(
+			networkDir, macaroons.IPLockChecker,
+		)
 		if err != nil {
 			srvrLog.Errorf("unable to create macaroon service: %v", err)
 			return err
 		}
 		defer macaroonService.Close()
-	}
 
-	// We wait until the user provides a password over RPC. In case lnd is
-	// started with the --noencryptwallet flag, we use the default password
-	// "hello" for wallet encryption.
-	privateWalletPw := []byte("hello")
-	publicWalletPw := []byte("public")
-	if !cfg.NoEncryptWallet {
-		privateWalletPw, publicWalletPw, err = waitForWalletPassword(
-			cfg.RPCListeners, cfg.RESTListeners, serverOpts, proxyOpts,
-			tlsConf, macaroonService,
-		)
-		if err != nil {
-			return err
-		}
-	}
-
-	if !cfg.NoMacaroons {
 		// Try to unlock the macaroon store with the private password.
-		// Ignore ErrAlreadyUnlocked since it could be unlocked by the
-		// wallet unlocker.
 		err = macaroonService.CreateUnlock(&privateWalletPw)
-		if err != nil && err != macaroons.ErrAlreadyUnlocked {
+		if err != nil {
 			srvrLog.Error(err)
 			return err
 		}
@@ -251,8 +266,10 @@ func lndMain() error {
 	// With the information parsed from the configuration, create valid
 	// instances of the pertinent interfaces required to operate the
 	// Lightning Network Daemon.
-	activeChainControl, chainCleanUp, err := newChainControlFromConfig(cfg,
-		chanDB, privateWalletPw, publicWalletPw)
+	activeChainControl, chainCleanUp, err := newChainControlFromConfig(
+		cfg, chanDB, privateWalletPw, publicWalletPw, birthday,
+		recoveryWindow, unlockedWallet,
+	)
 	if err != nil {
 		fmt.Printf("unable to create chain control: %v\n", err)
 		return err
@@ -267,17 +284,6 @@ func lndMain() error {
 	primaryChain := registeredChains.PrimaryChain()
 	registeredChains.RegisterChain(primaryChain, activeChainControl)
 
-	// Select the configuration and furnding parameters for Bitcoin or
-	// Litecoin, depending on the primary registered chain.
-	chainCfg := cfg.Bitcoin
-	minRemoteDelay := minBtcRemoteDelay
-	maxRemoteDelay := maxBtcRemoteDelay
-	if primaryChain == litecoinChain {
-		chainCfg = cfg.Litecoin
-		minRemoteDelay = minLtcRemoteDelay
-		maxRemoteDelay = maxLtcRemoteDelay
-	}
-
 	// TODO(roasbeef): add rotation
 	idPrivKey, err := activeChainControl.wallet.DerivePrivKey(keychain.KeyDescriptor{
 		KeyLocator: keychain.KeyLocator{
@@ -290,11 +296,10 @@ func lndMain() error {
 	}
 	idPrivKey.Curve = btcec.S256()
 
-	if cfg.Tor.Socks != "" && cfg.Tor.DNS != "" {
+	if cfg.Tor.Active {
 		srvrLog.Infof("Proxying all network traffic via Tor "+
-			"(stream_isolation=%v)! NOTE: If running with a full-node "+
-			"backend, ensure that is proxying over Tor as well",
-			cfg.Tor.StreamIsolation)
+			"(stream_isolation=%v)! NOTE: Ensure the backend node "+
+			"is proxying over Tor as well", cfg.Tor.StreamIsolation)
 	}
 
 	// Set up the core server which will listen for incoming peer
@@ -306,178 +311,6 @@ func lndMain() error {
 		srvrLog.Errorf("unable to create server: %v\n", err)
 		return err
 	}
-
-	// Next, we'll initialize the funding manager itself so it can answer
-	// queries while the wallet+chain are still syncing.
-	nodeSigner := newNodeSigner(idPrivKey)
-	var chanIDSeed [32]byte
-	if _, err := rand.Read(chanIDSeed[:]); err != nil {
-		return err
-	}
-	fundingMgr, err := newFundingManager(fundingConfig{
-		IDKey:              idPrivKey.PubKey(),
-		Wallet:             activeChainControl.wallet,
-		PublishTransaction: activeChainControl.wallet.PublishTransaction,
-		Notifier:           activeChainControl.chainNotifier,
-		FeeEstimator:       activeChainControl.feeEstimator,
-		SignMessage: func(pubKey *btcec.PublicKey,
-			msg []byte) (*btcec.Signature, error) {
-
-			if pubKey.IsEqual(idPrivKey.PubKey()) {
-				return nodeSigner.SignMessage(pubKey, msg)
-			}
-
-			return activeChainControl.msgSigner.SignMessage(
-				pubKey, msg,
-			)
-		},
-		CurrentNodeAnnouncement: func() (lnwire.NodeAnnouncement, error) {
-			return server.genNodeAnnouncement(true)
-		},
-		SendAnnouncement: func(msg lnwire.Message) error {
-			errChan := server.authGossiper.ProcessLocalAnnouncement(msg,
-				idPrivKey.PubKey())
-			return <-errChan
-		},
-		ArbiterChan:      server.breachArbiter.newContracts,
-		SendToPeer:       server.SendToPeer,
-		NotifyWhenOnline: server.NotifyWhenOnline,
-		FindPeer:         server.FindPeer,
-		TempChanIDSeed:   chanIDSeed,
-		FindChannel: func(chanID lnwire.ChannelID) (*lnwallet.LightningChannel, error) {
-			dbChannels, err := chanDB.FetchAllChannels()
-			if err != nil {
-				return nil, err
-			}
-
-			for _, channel := range dbChannels {
-				if chanID.IsChanPoint(&channel.FundingOutpoint) {
-					// TODO(roasbeef): populate beacon
-					return lnwallet.NewLightningChannel(
-						activeChainControl.signer,
-						server.witnessBeacon,
-						channel)
-				}
-			}
-
-			return nil, fmt.Errorf("unable to find channel")
-		},
-		DefaultRoutingPolicy: activeChainControl.routingPolicy,
-		NumRequiredConfs: func(chanAmt btcutil.Amount,
-			pushAmt lnwire.MilliSatoshi) uint16 {
-			// For large channels we increase the number
-			// of confirmations we require for the
-			// channel to be considered open. As it is
-			// always the responder that gets to choose
-			// value, the pushAmt is value being pushed
-			// to us. This means we have more to lose
-			// in the case this gets re-orged out, and
-			// we will require more confirmations before
-			// we consider it open.
-			// TODO(halseth): Use Litecoin params in case
-			// of LTC channels.
-
-			// In case the user has explicitly specified
-			// a default value for the number of
-			// confirmations, we use it.
-			defaultConf := uint16(chainCfg.DefaultNumChanConfs)
-			if defaultConf != 0 {
-				return defaultConf
-			}
-
-			// If not we return a value scaled linearly
-			// between 3 and 6, depending on channel size.
-			// TODO(halseth): Use 1 as minimum?
-			minConf := uint64(3)
-			maxConf := uint64(6)
-			maxChannelSize := uint64(
-				lnwire.NewMSatFromSatoshis(maxFundingAmount))
-			stake := lnwire.NewMSatFromSatoshis(chanAmt) + pushAmt
-			conf := maxConf * uint64(stake) / maxChannelSize
-			if conf < minConf {
-				conf = minConf
-			}
-			if conf > maxConf {
-				conf = maxConf
-			}
-			return uint16(conf)
-		},
-		RequiredRemoteDelay: func(chanAmt btcutil.Amount) uint16 {
-			// We scale the remote CSV delay (the time the
-			// remote have to claim funds in case of a unilateral
-			// close) linearly from minRemoteDelay blocks
-			// for small channels, to maxRemoteDelay blocks
-			// for channels of size maxFundingAmount.
-			// TODO(halseth): Litecoin parameter for LTC.
-
-			// In case the user has explicitly specified
-			// a default value for the remote delay, we
-			// use it.
-			defaultDelay := uint16(chainCfg.DefaultRemoteDelay)
-			if defaultDelay > 0 {
-				return defaultDelay
-			}
-
-			// If not we scale according to channel size.
-			delay := uint16(btcutil.Amount(maxRemoteDelay) *
-				chanAmt / maxFundingAmount)
-			if delay < minRemoteDelay {
-				delay = minRemoteDelay
-			}
-			if delay > maxRemoteDelay {
-				delay = maxRemoteDelay
-			}
-			return delay
-		},
-		WatchNewChannel: func(channel *channeldb.OpenChannel,
-			addr *lnwire.NetAddress) error {
-
-			// First, we'll mark this new peer as a persistent peer
-			// for re-connection purposes.
-			server.mu.Lock()
-			pubStr := string(addr.IdentityKey.SerializeCompressed())
-			server.persistentPeers[pubStr] = struct{}{}
-			server.mu.Unlock()
-
-			// With that taken care of, we'll send this channel to
-			// the chain arb so it can react to on-chain events.
-			return server.chainArb.WatchNewChannel(channel)
-		},
-		ReportShortChanID: func(chanPoint wire.OutPoint,
-			sid lnwire.ShortChannelID) error {
-
-			cid := lnwire.NewChanIDFromOutPoint(&chanPoint)
-			return server.htlcSwitch.UpdateShortChanID(cid, sid)
-		},
-		RequiredRemoteChanReserve: func(chanAmt btcutil.Amount) btcutil.Amount {
-			// By default, we'll require the remote peer to maintain
-			// at least 1% of the total channel capacity at all
-			// times.
-			return chanAmt / 100
-		},
-		RequiredRemoteMaxValue: func(chanAmt btcutil.Amount) lnwire.MilliSatoshi {
-			// By default, we'll allow the remote peer to fully
-			// utilize the full bandwidth of the channel, minus our
-			// required reserve.
-			reserve := lnwire.NewMSatFromSatoshis(chanAmt / 100)
-			return lnwire.NewMSatFromSatoshis(chanAmt) - reserve
-		},
-		RequiredRemoteMaxHTLCs: func(chanAmt btcutil.Amount) uint16 {
-			// By default, we'll permit them to utilize the full
-			// channel bandwidth.
-			return uint16(lnwallet.MaxHTLCNumber / 2)
-		},
-		ZombieSweeperInterval: 1 * time.Minute,
-		ReservationTimeout:    10 * time.Minute,
-		MinChanSize:           btcutil.Amount(cfg.MinChanSize),
-	})
-	if err != nil {
-		return err
-	}
-	if err := fundingMgr.Start(); err != nil {
-		return err
-	}
-	server.fundingMgr = fundingMgr
 
 	// Check macaroon authentication if macaroons aren't disabled.
 	if macaroonService != nil {
@@ -495,15 +328,18 @@ func lndMain() error {
 	if err := rpcServer.Start(); err != nil {
 		return err
 	}
+	defer rpcServer.Stop()
 
 	grpcServer := grpc.NewServer(serverOpts...)
 	lnrpc.RegisterLightningServer(grpcServer, rpcServer)
 
 	// Next, Start the gRPC server listening for HTTP/2 connections.
 	for _, listener := range cfg.RPCListeners {
-		lis, err := net.Listen("tcp", listener)
+		lis, err := lncfg.ListenOnAddress(listener)
 		if err != nil {
-			ltndLog.Errorf("RPC server unable to listen on %s", listener)
+			ltndLog.Errorf(
+				"RPC server unable to listen on %s", listener,
+			)
 			return err
 		}
 		defer lis.Close()
@@ -515,21 +351,25 @@ func lndMain() error {
 
 	// Finally, start the REST proxy for our gRPC server above.
 	mux := proxy.NewServeMux()
-	err = lnrpc.RegisterLightningHandlerFromEndpoint(ctx, mux,
-		cfg.RPCListeners[0], proxyOpts)
+	err = lnrpc.RegisterLightningHandlerFromEndpoint(
+		ctx, mux, cfg.RPCListeners[0].String(), proxyOpts,
+	)
 	if err != nil {
 		return err
 	}
 	for _, restEndpoint := range cfg.RESTListeners {
-		listener, err := tls.Listen("tcp", restEndpoint, tlsConf)
+		lis, err := lncfg.TLSListenOnAddress(restEndpoint, tlsConf)
 		if err != nil {
-			ltndLog.Errorf("gRPC proxy unable to listen on %s", restEndpoint)
+			ltndLog.Errorf(
+				"gRPC proxy unable to listen on %s",
+				restEndpoint,
+			)
 			return err
 		}
-		defer listener.Close()
+		defer lis.Close()
 		go func() {
-			rpcsLog.Infof("gRPC proxy started at %s", listener.Addr())
-			http.Serve(listener, mux)
+			rpcsLog.Infof("gRPC proxy started at %s", lis.Addr())
+			http.Serve(lis, mux)
 		}()
 	}
 
@@ -547,6 +387,10 @@ func lndMain() error {
 			"start_height=%v", bestHeight)
 
 		for {
+			if !signal.Alive() {
+				return nil
+			}
+
 			synced, _, err := activeChainControl.wallet.IsSynced()
 			if err != nil {
 				return err
@@ -574,10 +418,10 @@ func lndMain() error {
 		srvrLog.Errorf("unable to start server: %v\n", err)
 		return err
 	}
+	defer server.Stop()
 
 	// Now that the server has started, if the autopilot mode is currently
 	// active, then we'll initialize a fresh instance of it and start it.
-	var pilot *autopilot.Agent
 	if cfg.Autopilot.Active {
 		pilot, err := initAutoPilot(server, cfg.Autopilot)
 		if err != nil {
@@ -590,25 +434,12 @@ func lndMain() error {
 				err)
 			return err
 		}
+		defer pilot.Stop()
 	}
-
-	addInterruptHandler(func() {
-		ltndLog.Infof("Gracefully shutting down the server...")
-		rpcServer.Stop()
-		fundingMgr.Stop()
-		server.Stop()
-
-		if pilot != nil {
-			pilot.Stop()
-		}
-
-		server.WaitForShutdown()
-	})
 
 	// Wait for shutdown signal from either a graceful server stop or from
 	// the interrupt handler.
-	<-shutdownChannel
-	ltndLog.Info("Shutdown complete")
+	<-signal.ShutdownChannel()
 	return nil
 }
 
@@ -705,6 +536,10 @@ func genCertPair(certFile, keyFile string) error {
 		dnsNames = append(dnsNames, cfg.TLSExtraDomain)
 	}
 
+	// Also add fake hostnames for unix sockets, otherwise hostname
+	// verification will fail in the client.
+	dnsNames = append(dnsNames, "unix", "unixpacket")
+
 	// Generate a private key for the certificate.
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -723,7 +558,7 @@ func genCertPair(certFile, keyFile string) error {
 
 		KeyUsage: x509.KeyUsageKeyEncipherment |
 			x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		IsCA: true, // so can sign self.
+		IsCA:                  true, // so can sign self.
 		BasicConstraintsValid: true,
 
 		DNSNames:    dnsNames,
@@ -767,8 +602,9 @@ func genCertPair(certFile, keyFile string) error {
 	return nil
 }
 
-// genMacaroons generates a pair of macaroon files; one admin-level and one
-// read-only. These can also be used to generate more granular macaroons.
+// genMacaroons generates three macaroon files; one admin-level, one
+// for invoice access and one read-only. These can also be used
+// to generate more granular macaroons.
 func genMacaroons(ctx context.Context, svc *macaroons.Service,
 	admFile, roFile, invoiceFile string) error {
 
@@ -827,23 +663,55 @@ func genMacaroons(ctx context.Context, svc *macaroons.Service,
 	return nil
 }
 
+// WalletUnlockParams holds the variables used to parameterize the unlocking of
+// lnd's wallet after it has already been created.
+type WalletUnlockParams struct {
+	// Password is the public and private wallet passphrase.
+	Password []byte
+
+	// Birthday specifies the approximate time that this wallet was created.
+	// This is used to bound any rescans on startup.
+	Birthday time.Time
+
+	// RecoveryWindow specifies the address lookahead when entering recovery
+	// mode. A recovery will be attempted if this value is non-zero.
+	RecoveryWindow uint32
+
+	// Wallet is the loaded and unlocked Wallet. This is returned
+	// from the unlocker service to avoid it being unlocked twice (once in
+	// the unlocker service to check if the password is correct and again
+	// later when lnd actually uses it). Because unlocking involves scrypt
+	// which is resource intensive, we want to avoid doing it twice.
+	Wallet *wallet.Wallet
+}
+
 // waitForWalletPassword will spin up gRPC and REST endpoints for the
 // WalletUnlocker server, and block until a password is provided by
 // the user to this RPC server.
-func waitForWalletPassword(grpcEndpoints, restEndpoints []string,
+func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 	serverOpts []grpc.ServerOption, proxyOpts []grpc.DialOption,
-	tlsConf *tls.Config, macaroonService *macaroons.Service) ([]byte, []byte, error) {
+	tlsConf *tls.Config) (*WalletUnlockParams, error) {
 
-	// Set up a new PasswordService, which will listen
-	// for passwords provided over RPC.
+	// Set up a new PasswordService, which will listen for passwords
+	// provided over RPC.
 	grpcServer := grpc.NewServer(serverOpts...)
 
 	chainConfig := cfg.Bitcoin
 	if registeredChains.PrimaryChain() == litecoinChain {
 		chainConfig = cfg.Litecoin
 	}
-	pwService := walletunlocker.New(macaroonService,
-		chainConfig.ChainDir, activeNetParams.Params)
+
+	// The macaroon files are passed to the wallet unlocker since they are
+	// also encrypted with the wallet's password. These files will be
+	// deleted within it and recreated when successfully changing the
+	// wallet's password.
+	macaroonFiles := []string{
+		filepath.Join(networkDir, macaroons.DBFilename),
+		cfg.AdminMacPath, cfg.ReadMacPath, cfg.InvoiceMacPath,
+	}
+	pwService := walletunlocker.New(
+		chainConfig.ChainDir, activeNetParams.Params, macaroonFiles,
+	)
 	lnrpc.RegisterWalletUnlockerServer(grpcServer, pwService)
 
 	// Use a WaitGroup so we can be sure the instructions on how to input the
@@ -853,17 +721,22 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []string,
 	for _, grpcEndpoint := range grpcEndpoints {
 		// Start a gRPC server listening for HTTP/2 connections, solely
 		// used for getting the encryption password from the client.
-		lis, err := net.Listen("tcp", grpcEndpoint)
+		lis, err := lncfg.ListenOnAddress(grpcEndpoint)
 		if err != nil {
-			ltndLog.Errorf("password RPC server unable to listen on %s",
-				grpcEndpoint)
-			return nil, nil, err
+			ltndLog.Errorf(
+				"password RPC server unable to listen on %s",
+				grpcEndpoint,
+			)
+			return nil, err
 		}
 		defer lis.Close()
 
 		wg.Add(1)
 		go func() {
-			rpcsLog.Infof("password RPC server listening on %s", lis.Addr())
+			rpcsLog.Infof(
+				"password RPC server listening on %s",
+				lis.Addr(),
+			)
 			wg.Done()
 			grpcServer.Serve(lis)
 		}()
@@ -876,26 +749,32 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []string,
 
 	mux := proxy.NewServeMux()
 
-	err := lnrpc.RegisterWalletUnlockerHandlerFromEndpoint(ctx, mux,
-		grpcEndpoints[0], proxyOpts)
+	err := lnrpc.RegisterWalletUnlockerHandlerFromEndpoint(
+		ctx, mux, grpcEndpoints[0].String(), proxyOpts,
+	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	srv := &http.Server{Handler: mux}
 
 	for _, restEndpoint := range restEndpoints {
-		lis, err := tls.Listen("tcp", restEndpoint, tlsConf)
+		lis, err := lncfg.TLSListenOnAddress(restEndpoint, tlsConf)
 		if err != nil {
-			ltndLog.Errorf("password gRPC proxy unable to listen on %s",
-				restEndpoint)
-			return nil, nil, err
+			ltndLog.Errorf(
+				"password gRPC proxy unable to listen on %s",
+				restEndpoint,
+			)
+			return nil, err
 		}
 		defer lis.Close()
 
 		wg.Add(1)
 		go func() {
-			rpcsLog.Infof("password gRPC proxy started at %s", lis.Addr())
+			rpcsLog.Infof(
+				"password gRPC proxy started at %s",
+				lis.Addr(),
+			)
 			wg.Done()
 			srv.Serve(lis)
 		}()
@@ -905,9 +784,10 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []string,
 	wg.Wait()
 
 	// Wait for user to provide the password.
-	ltndLog.Infof("Waiting for wallet encryption password. " +
-		"Use `lncli create` to create wallet, or " +
-		"`lncli unlock` to unlock already created wallet.")
+	ltndLog.Infof("Waiting for wallet encryption password. Use `lncli " +
+		"create` to create a wallet, `lncli unlock` to unlock an " +
+		"existing wallet, or `lncli changepassword` to change the " +
+		"password of an existing wallet and unlock it.")
 
 	// We currently don't distinguish between getting a password to be used
 	// for creation or unlocking, as a new wallet db will be created if
@@ -920,14 +800,15 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []string,
 	case initMsg := <-pwService.InitMsgs:
 		password := initMsg.Passphrase
 		cipherSeed := initMsg.WalletSeed
+		recoveryWindow := initMsg.RecoveryWindow
 
 		// Before we proceed, we'll check the internal version of the
 		// seed. If it's greater than the current key derivation
 		// version, then we'll return an error as we don't understand
 		// this.
 		if cipherSeed.InternalVersion != keychain.KeyDerivationVersion {
-			return nil, nil, fmt.Errorf("invalid internal seed "+
-				"version %v, current version is %v",
+			return nil, fmt.Errorf("invalid internal seed version "+
+				"%v, current version is %v",
 				cipherSeed.InternalVersion,
 				keychain.KeyDerivationVersion)
 		}
@@ -935,31 +816,46 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []string,
 		netDir := btcwallet.NetworkDir(
 			chainConfig.ChainDir, activeNetParams.Params,
 		)
-		loader := wallet.NewLoader(activeNetParams.Params, netDir)
+		loader := wallet.NewLoader(
+			activeNetParams.Params, netDir, uint32(recoveryWindow),
+		)
 
 		// With the seed, we can now use the wallet loader to create
-		// the wallet, then unload it so it can be opened shortly
-		// after.
-		// TODO(roasbeef): extend loader to also accept birthday
-		_, err = loader.CreateNewWallet(
-			password, password, cipherSeed.Entropy[:],
+		// the wallet, then pass it back to avoid unlocking it again.
+		birthday := cipherSeed.BirthdayTime()
+		newWallet, err := loader.CreateNewWallet(
+			password, password, cipherSeed.Entropy[:], birthday,
 		)
 		if err != nil {
-			return nil, nil, err
+			// Don't leave the file open in case the new wallet
+			// could not be created for whatever reason.
+			if err := loader.UnloadWallet(); err != nil {
+				ltndLog.Errorf("Could not unload new "+
+					"wallet: %v", err)
+			}
+			return nil, err
 		}
 
-		if err := loader.UnloadWallet(); err != nil {
-			return nil, nil, err
+		walletInitParams := &WalletUnlockParams{
+			Password:       password,
+			Birthday:       birthday,
+			RecoveryWindow: recoveryWindow,
+			Wallet:         newWallet,
 		}
 
-		return password, password, nil
+		return walletInitParams, nil
 
 	// The wallet has already been created in the past, and is simply being
 	// unlocked. So we'll just return these passphrases.
-	case walletPw := <-pwService.UnlockPasswords:
-		return walletPw, walletPw, nil
+	case unlockMsg := <-pwService.UnlockMsgs:
+		walletInitParams := &WalletUnlockParams{
+			Password:       unlockMsg.Passphrase,
+			RecoveryWindow: unlockMsg.RecoveryWindow,
+			Wallet:         unlockMsg.Wallet,
+		}
+		return walletInitParams, nil
 
-	case <-shutdownChannel:
-		return nil, nil, fmt.Errorf("shutting down")
+	case <-signal.ShutdownChannel():
+		return nil, fmt.Errorf("shutting down")
 	}
 }
